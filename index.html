@@ -1,179 +1,114 @@
 // =========================================================
-// supabase-client.js
-// Drop this into your GitHub Pages site and include via:
+// supabase-backend.js
+// Include this AFTER your existing index.html <script> block
+// (or move it into a separate <script> tag right before </body>,
+// after the Supabase JS CDN tag):
+//
 //   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-//   <script src="supabase-client.js"></script>
+//   ... your existing inline <script> with all the app code ...
+//   <script src="supabase-backend.js"></script>
+//
+// This overrides requestBackend/backendAvailable so every apiCall(...)
+// in your app now talks to Supabase instead of Google Apps Script.
 // =========================================================
 
 const SUPABASE_URL = "https://YOUR-PROJECT.supabase.co";
 const SUPABASE_ANON_KEY = "YOUR-ANON-KEY";
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Always report the backend as available (no Apps Script URL needed)
+backendAvailable = function () { return true; };
 
-// ---------- Auth ----------
+// Diocese full-name lookup cache (used for requestOtp email step)
+let _pendingOtpDiocese = null;
 
-// Sends a magic-link / OTP code to the email. User must already exist
-// in app_users (added by an admin) for their role/diocese to resolve.
-async function signIn(email) {
-  const { error } = await supabase.auth.signInWithOtp({ email });
-  if (error) throw error;
-  return true; // tell user to check their email
-}
-
-async function verifyOtp(email, token) {
-  const { data, error } = await supabase.auth.verifyOtp({
-    email, token, type: "email",
-  });
-  if (error) throw error;
-  return data.session;
-}
-
-async function signOut() {
-  await supabase.auth.signOut();
-}
-
-// Returns { email, role, diocese_code, name } for the logged-in user
-async function getCurrentUser() {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return null;
-  const { data, error } = await supabase
-    .from("app_users")
-    .select("email, role, diocese_code, name, active")
-    .eq("auth_user_id", user.id)
-    .single();
-  if (error) throw error;
+async function _rpc(fn, args) {
+  const { data, error } = await sb.rpc(fn, args);
+  if (error) throw new Error(error.message || String(error));
+  if (data && data.ok === false) throw new Error(data.error || "Request failed.");
   return data;
 }
 
-// ---------- Reference data ----------
+requestBackend = function (action, data, ok, fail, showLoading = true) {
+  const failed = fail || loginFail;
+  if (showLoading) showBackendLoading(action);
+  const done = (result) => { if (showLoading) hideBackendLoading(); try { ok(result || {}); } catch (e) { failed(e.message || String(e)); } };
+  const err = (e) => { if (showLoading) hideBackendLoading(); failed(e.message || String(e)); };
 
-async function getDioceses() {
-  const { data, error } = await supabase.from("dioceses").select("*").eq("active", true);
-  if (error) throw error;
-  return data;
-}
+  (async () => {
+    try {
+      switch (action) {
+        case "loginAdmin":
+          return done(await _rpc("login_admin", { p_passcode: data.passcode }));
 
-async function getCenters(dioceseCode) {
-  let q = supabase.from("centers").select("*").eq("active", true);
-  if (dioceseCode) q = q.eq("diocese_code", dioceseCode);
-  const { data, error } = await q;
-  if (error) throw error;
-  return data;
-}
+        case "loginUserPassword":
+          return done(await _rpc("login_user_password", {
+            p_email: data.email, p_diocese_name: data.diocese, p_passcode: data.passcode,
+          }));
 
-async function getSchools(centerCode) {
-  let q = supabase.from("schools").select("*").eq("active", true);
-  if (centerCode) q = q.eq("center_code", centerCode);
-  const { data, error } = await q;
-  if (error) throw error;
-  return data;
-}
+        case "requestOtp":
+          _pendingOtpDiocese = data.diocese;
+          { const { error } = await sb.auth.signInWithOtp({ email: data.email }); if (error) throw error; }
+          return done({ ok: true });
 
-async function getClasses() {
-  const { data, error } = await supabase.from("classes").select("*");
-  if (error) throw error;
-  return data;
-}
+        case "verifyOtp": {
+          const { error: vErr } = await sb.auth.verifyOtp({ email: data.email, token: data.otp, type: "email" });
+          if (vErr) throw vErr;
+          return done(await _rpc("session_after_otp", { p_diocese_name: _pendingOtpDiocese || data.diocese }));
+        }
 
-async function getItems() {
-  const { data, error } = await supabase.from("items").select("*").order("sort_order");
-  if (error) throw error;
-  return data;
-}
+        case "bootstrap":
+          return done(await _rpc("bootstrap", { p_token: data.token }));
 
-// ---------- Participants ----------
-// RLS automatically scopes results to the logged-in user's diocese
-// (admins see everything).
+        case "publicConfig":
+          { const { data: d, error } = await sb.rpc("public_config"); if (error) throw error; return done(d); }
 
-async function listParticipants(dioceseCode) {
-  let q = supabase.from("participants").select("*, marks(*)").order("sl_no");
-  if (dioceseCode) q = q.eq("diocese_code", dioceseCode);
-  const { data, error } = await q;
-  if (error) throw error;
-  return data;
-}
+        case "saveParticipants":
+          return done(await _rpc("save_participants", { p_token: data.token, p_diocese_name: data.diocese, p_groups: data.groups }));
 
-async function saveParticipant(participant) {
-  // participant = { id?, reg_no, name, diocese_code, class_code, gender,
-  //                  dob, center, sunday_school, items_json: [...] }
-  const { data, error } = await supabase
-    .from("participants")
-    .upsert(participant)
-    .select()
-    .single();
-  if (error) throw error;
-  return data;
-}
+        case "updateParticipant":
+          return done(await _rpc("update_participant", { p_token: data.token, p_student_id: data.studentId, p_patch: data.patch }));
 
-async function deleteParticipant(id) {
-  const { error } = await supabase.from("participants").delete().eq("id", id);
-  if (error) throw error;
-}
+        case "deleteParticipant":
+          return done(await _rpc("delete_participant", { p_token: data.token, p_student_id: data.studentId }));
 
-// ---------- Marks ----------
+        case "clearAll":
+          return done(await _rpc("clear_all", { p_token: data.token }));
 
-async function saveMark(participantId, itemId, mark, judgeScores, remarks) {
-  const { data, error } = await supabase
-    .from("marks")
-    .upsert({
-      participant_id: participantId,
-      item_id: itemId,
-      mark,
-      judge_scores_json: judgeScores,
-      remarks,
-      updated_by: (await getCurrentUser())?.email,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: "participant_id,item_id" })
-    .select()
-    .single();
-  if (error) throw error;
-  return data;
-}
+        case "saveMark":
+          return done(await _rpc("save_mark", {
+            p_token: data.token, p_student_id: data.studentId, p_item_id: data.itemId,
+            p_mark: data.mark, p_judge: data.judge, p_remarks: data.remarks,
+          }));
 
-async function getMarksForItem(itemId) {
-  const { data, error } = await supabase
-    .from("marks")
-    .select("*, participants(name, reg_no, diocese_code, center)")
-    .eq("item_id", itemId);
-  if (error) throw error;
-  return data;
-}
+        case "deleteMark":
+          return done(await _rpc("delete_mark", { p_token: data.token, p_student_id: data.studentId, p_item_id: data.itemId }));
 
-// ---------- Admin: manage allowed users ----------
-// Only works if the logged-in user has role='admin' (enforced by RLS).
+        case "saveMarksBulk":
+          return done(await _rpc("save_marks_bulk", { p_token: data.token, p_entries: data.entries }));
 
-async function listUsers() {
-  const { data, error } = await supabase.from("app_users").select("*").order("email");
-  if (error) throw error;
-  return data;
-}
+        case "saveUserAccount":
+          return done(await _rpc("save_user_account", { p_token: data.token, p_user: data.user }));
 
-async function addOrUpdateUser({ email, diocese_code, role, name, active = true }) {
-  const { data, error } = await supabase
-    .from("app_users")
-    .upsert({ email, diocese_code, role, name, active }, { onConflict: "email" })
-    .select()
-    .single();
-  if (error) throw error;
-  return data;
-}
+        case "saveSchool":
+          return done(await _rpc("save_school", { p_token: data.token, p_school: data.school }));
 
-async function deactivateUser(email) {
-  const { error } = await supabase
-    .from("app_users")
-    .update({ active: false })
-    .eq("email", email);
-  if (error) throw error;
-}
+        case "saveProgramme":
+          return done(await _rpc("save_programme", { p_token: data.token, p_programme: data.programme }));
 
-// ---------- Audit log ----------
+        case "saveSettings":
+          return done(await _rpc("save_settings", { p_token: data.token, p_settings: data.settings }));
 
-async function logAction(action, details = {}) {
-  const user = await getCurrentUser();
-  const { error } = await supabase.from("audit_log").insert({
-    email: user?.email,
-    action,
-    details,
-  });
-  if (error) console.warn("audit log failed", error);
-}
+        case "saveCertificateTemplates":
+          return done(await _rpc("save_certificate_templates", { p_token: data.token, p_templates: data.templates }));
+
+        default:
+          return err(new Error("Unknown action: " + action));
+      }
+    } catch (e) {
+      return err(e);
+    }
+  })();
+};
+
+apiCall = function (action, data, ok, fail) { requestBackend(action, data, ok, fail, true); };

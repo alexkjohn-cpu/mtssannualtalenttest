@@ -1,0 +1,179 @@
+// =========================================================
+// supabase-client.js
+// Drop this into your GitHub Pages site and include via:
+//   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+//   <script src="supabase-client.js"></script>
+// =========================================================
+
+const SUPABASE_URL = "https://YOUR-PROJECT.supabase.co";
+const SUPABASE_ANON_KEY = "YOUR-ANON-KEY";
+
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ---------- Auth ----------
+
+// Sends a magic-link / OTP code to the email. User must already exist
+// in app_users (added by an admin) for their role/diocese to resolve.
+async function signIn(email) {
+  const { error } = await supabase.auth.signInWithOtp({ email });
+  if (error) throw error;
+  return true; // tell user to check their email
+}
+
+async function verifyOtp(email, token) {
+  const { data, error } = await supabase.auth.verifyOtp({
+    email, token, type: "email",
+  });
+  if (error) throw error;
+  return data.session;
+}
+
+async function signOut() {
+  await supabase.auth.signOut();
+}
+
+// Returns { email, role, diocese_code, name } for the logged-in user
+async function getCurrentUser() {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+  const { data, error } = await supabase
+    .from("app_users")
+    .select("email, role, diocese_code, name, active")
+    .eq("auth_user_id", user.id)
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+// ---------- Reference data ----------
+
+async function getDioceses() {
+  const { data, error } = await supabase.from("dioceses").select("*").eq("active", true);
+  if (error) throw error;
+  return data;
+}
+
+async function getCenters(dioceseCode) {
+  let q = supabase.from("centers").select("*").eq("active", true);
+  if (dioceseCode) q = q.eq("diocese_code", dioceseCode);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data;
+}
+
+async function getSchools(centerCode) {
+  let q = supabase.from("schools").select("*").eq("active", true);
+  if (centerCode) q = q.eq("center_code", centerCode);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data;
+}
+
+async function getClasses() {
+  const { data, error } = await supabase.from("classes").select("*");
+  if (error) throw error;
+  return data;
+}
+
+async function getItems() {
+  const { data, error } = await supabase.from("items").select("*").order("sort_order");
+  if (error) throw error;
+  return data;
+}
+
+// ---------- Participants ----------
+// RLS automatically scopes results to the logged-in user's diocese
+// (admins see everything).
+
+async function listParticipants(dioceseCode) {
+  let q = supabase.from("participants").select("*, marks(*)").order("sl_no");
+  if (dioceseCode) q = q.eq("diocese_code", dioceseCode);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data;
+}
+
+async function saveParticipant(participant) {
+  // participant = { id?, reg_no, name, diocese_code, class_code, gender,
+  //                  dob, center, sunday_school, items_json: [...] }
+  const { data, error } = await supabase
+    .from("participants")
+    .upsert(participant)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function deleteParticipant(id) {
+  const { error } = await supabase.from("participants").delete().eq("id", id);
+  if (error) throw error;
+}
+
+// ---------- Marks ----------
+
+async function saveMark(participantId, itemId, mark, judgeScores, remarks) {
+  const { data, error } = await supabase
+    .from("marks")
+    .upsert({
+      participant_id: participantId,
+      item_id: itemId,
+      mark,
+      judge_scores_json: judgeScores,
+      remarks,
+      updated_by: (await getCurrentUser())?.email,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "participant_id,item_id" })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function getMarksForItem(itemId) {
+  const { data, error } = await supabase
+    .from("marks")
+    .select("*, participants(name, reg_no, diocese_code, center)")
+    .eq("item_id", itemId);
+  if (error) throw error;
+  return data;
+}
+
+// ---------- Admin: manage allowed users ----------
+// Only works if the logged-in user has role='admin' (enforced by RLS).
+
+async function listUsers() {
+  const { data, error } = await supabase.from("app_users").select("*").order("email");
+  if (error) throw error;
+  return data;
+}
+
+async function addOrUpdateUser({ email, diocese_code, role, name, active = true }) {
+  const { data, error } = await supabase
+    .from("app_users")
+    .upsert({ email, diocese_code, role, name, active }, { onConflict: "email" })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function deactivateUser(email) {
+  const { error } = await supabase
+    .from("app_users")
+    .update({ active: false })
+    .eq("email", email);
+  if (error) throw error;
+}
+
+// ---------- Audit log ----------
+
+async function logAction(action, details = {}) {
+  const user = await getCurrentUser();
+  const { error } = await supabase.from("audit_log").insert({
+    email: user?.email,
+    action,
+    details,
+  });
+  if (error) console.warn("audit log failed", error);
+}
